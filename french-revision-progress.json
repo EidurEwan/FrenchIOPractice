@@ -1,0 +1,39 @@
+{
+  "attempts": [
+    {
+      "category": "verbs",
+      "mode": "recall",
+      "score": 6,
+      "total": 10,
+      "detail": "Présent",
+      "pct": 0.6,
+      "ts": 1772652294703
+    }
+  ],
+  "srs": {
+    "verbs::Présent": {
+      "key": "verbs::Présent",
+      "category": "verbs",
+      "detail": "Présent",
+      "accuracy": 0.6,
+      "ease": 2.36,
+      "interval": 5,
+      "repetitions": 1,
+      "streak": 1,
+      "lastReview": 1772652294703,
+      "nextReview": 1772652594703,
+      "attempts": 1,
+      "bestScore": 0.6,
+      "history": [
+        {
+          "ts": 1772652294703,
+          "pct": 0.6,
+          "mode": "recall"
+        }
+      ]
+    }
+  },
+  "totalSessions": 1,
+  "firstOpened": 1772652273789,
+  "exportedAt": "2026-03-08T16:19:47.659Z"
+}
