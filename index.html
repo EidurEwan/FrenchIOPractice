@@ -4,36 +4,25 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>French Ab Initio — Oral Revision</title>
-
-  <!-- PWA / iOS Homescreen -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="French Oral">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#0c0f1a">
   <link rel="manifest" href="data:application/json;base64,ewogICJuYW1lIjogIkZyZW5jaCBBYiBJbml0aW8gT3JhbCBSZXZpc2lvbiIsCiAgInNob3J0X25hbWUiOiAiRnJlbmNoIE9yYWwiLAogICJzdGFydF91cmwiOiAiLiIsCiAgImRpc3BsYXkiOiAic3RhbmRhbG9uZSIsCiAgImJhY2tncm91bmRfY29sb3IiOiAiIzBjMGYxYSIsCiAgInRoZW1lX2NvbG9yIjogIiMwYzBmMWEiLAogICJpY29ucyI6IFtdCn0K">
-
-  <!-- Prevent 300ms tap delay -->
   <meta name="format-detection" content="telephone=no">
-
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body { overflow-x: hidden; -webkit-text-size-adjust: 100%; }
-    input, textarea, button { font-family: inherit; font-size: 16px; /* prevents iOS zoom */ }
+    input, textarea, button { font-family: inherit; font-size: 16px; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: #0c0f1a; }
     ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: #334155; }
-
-    /* Hide scrollbar on horizontal scroll containers */
     div::-webkit-scrollbar { height: 0; width: 0; }
-
-    /* Safe area padding for notched iPhones */
     @supports (padding-bottom: env(safe-area-inset-bottom)) {
       body { padding-bottom: env(safe-area-inset-bottom); }
     }
-
-    /* Touch-friendly tap targets */
     @media (max-width: 639px) {
       button { min-height: 44px; }
       input, textarea { font-size: 16px !important; }
@@ -178,6 +167,64 @@ function saveToStorage(data) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
   } catch { /* quota exceeded or unavailable */ }
+}
+
+
+// ─── Cloud Sync (Google Apps Script) ─────────────────────────────────────────
+const CLOUD_URL_KEY = "french-oral-cloud-url";
+const CLOUD_LAST_PUSH_KEY = "french-oral-cloud-last-push";
+
+function getCloudUrl() {
+  try { return localStorage.getItem(CLOUD_URL_KEY) || ""; } catch { return ""; }
+}
+function setCloudUrl(url) {
+  try { localStorage.setItem(CLOUD_URL_KEY, url); } catch {}
+}
+
+async function cloudPush(data) {
+  const url = getCloudUrl();
+  if (!url) return { ok: false, error: "No URL configured" };
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ data }),
+    });
+    const json = await res.json();
+    if (json.success) {
+      try { localStorage.setItem(CLOUD_LAST_PUSH_KEY, new Date().toISOString()); } catch {}
+    }
+    return { ok: json.success };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+async function cloudPull() {
+  const url = getCloudUrl();
+  if (!url) return { ok: false, error: "No URL configured" };
+  try {
+    const res = await fetch(url + "?action=load");
+    const json = await res.json();
+    if (json && (json.attempts || json.srs)) {
+      return { ok: true, data: json };
+    }
+    return { ok: true, data: null }; // empty cloud
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function mergeCloudData(local, remote) {
+  // Whichever has more attempts wins; merge SRS by keeping the one with more reviews
+  if (!remote || !remote.attempts) return local;
+  if (!local || !local.attempts) return remote;
+  
+  const localScore = (local.attempts?.length || 0) + Object.keys(local.srs || {}).length;
+  const remoteScore = (remote.attempts?.length || 0) + Object.keys(remote.srs || {}).length;
+  
+  if (remoteScore > localScore) return remote;
+  return local;
 }
 
 function createStatsStore() {
@@ -1291,10 +1338,42 @@ function App() {
   const [updateCount, forceUpdate] = useState(0);
   const triggerUpdate = useCallback(() => forceUpdate(n => n + 1), []);
 
+  // Cloud sync: auto-push after practice rounds
+  const pushTimerRef = useRef(null);
+  const autoPush = useCallback(() => {
+    if (!getCloudUrl()) return;
+    clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = setTimeout(() => {
+      const data = { attempts: stats.attempts, srs: stats.srs, totalSessions: stats.totalSessions, firstOpened: stats.firstOpened };
+      cloudPush(data).catch(() => {});
+    }, 2000);
+  }, [stats]);
+
+  // Cloud sync: auto-pull on mount
+  useEffect(() => {
+    if (!getCloudUrl()) return;
+    cloudPull().then(result => {
+      if (result.ok && result.data) {
+        const merged = mergeCloudData(
+          { attempts: stats.attempts, srs: stats.srs, totalSessions: stats.totalSessions, firstOpened: stats.firstOpened },
+          result.data
+        );
+        if (merged !== null && merged.attempts !== stats.attempts) {
+          stats.attempts = merged.attempts || [];
+          stats.srs = merged.srs || {};
+          stats.totalSessions = merged.totalSessions || stats.totalSessions;
+          stats.firstOpened = merged.firstOpened || stats.firstOpened;
+          stats._save();
+          triggerUpdate();
+        }
+      }
+    }).catch(() => {});
+  }, []);
+
   // Wrap record to trigger re-render
   const trackedStats = useMemo(() => ({
     ...stats,
-    record: (...args) => { stats.record(...args); triggerUpdate(); },
+    record: (...args) => { stats.record(...args); triggerUpdate(); autoPush(); },
     clearAll: () => { stats.clearAll(); triggerUpdate(); },
     setTab,
     attempts: stats.attempts,
@@ -3694,26 +3773,7 @@ function ProficiencyTab() {
     return modes;
   }, [attempts]);
 
-  if (attempts.length === 0) {
-    return (
-      <div style={{ textAlign: "center", padding: "60px 24px" }}>
-        <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
-        <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 20, fontWeight: 700, color: "#e2e8f0", marginBottom: 8 }}>No data yet</div>
-        <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 14, color: "#64748b", lineHeight: 1.6, maxWidth: 320, margin: "0 auto" }}>
-          Complete practice rounds in Recall, Mastery, Type It, or Match mode across any tab to start tracking your proficiency.
-        </div>
-        <div style={{
-          marginTop: 20, padding: "10px 16px", borderRadius: 8, display: "inline-block",
-          background: stats.hasLocalStorage ? "rgba(52,211,153,0.05)" : "rgba(245,158,11,0.05)",
-          border: `1px solid ${stats.hasLocalStorage ? "rgba(52,211,153,0.15)" : "rgba(245,158,11,0.15)"}`,
-        }}>
-          <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: stats.hasLocalStorage ? "#34d399" : "#f59e0b" }}>
-            {stats.hasLocalStorage ? "💾 Progress will be saved between sessions" : "⚠️ Open the downloaded HTML in your browser to save progress"}
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const isEmpty = attempts.length === 0;
 
   const ringSize = 160;
   const ringStroke = 12;
@@ -3723,6 +3783,85 @@ function ProficiencyTab() {
 
   return (
     <div>
+      {/* Getting Started — shows when empty, collapsible when data exists */}
+      {isEmpty ? (
+        <div style={{
+          padding: "20px", borderRadius: 12, marginBottom: 16,
+          background: "linear-gradient(135deg, #1e1b4b, #0f172a)", border: "1px solid rgba(99,102,241,0.3)",
+        }}>
+          <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 16, fontWeight: 700, color: "#e2e8f0", marginBottom: 12 }}>
+            👋 Welcome to your revision tool
+          </div>
+          <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: "#94a3b8", lineHeight: 1.7, marginBottom: 14 }}>
+            Everything below will fill in as you practice. Here's how to get started:
+          </div>
+          {[
+            { icon: "🃏", title: "Vocab tab", desc: "Flashcards grouped by IB theme — use Recall, Mastery, Type It, or Match to practice" },
+            { icon: "💬", title: "Phrases tab", desc: "Key expressions with 6 practice modes including Sentence Builder" },
+            { icon: "⏳", title: "Verbs tab", desc: "Conjugation tables + recall drills with random pronouns" },
+            { icon: "🌍", title: "Culture tab", desc: "Francophone cultural facts you can use in your oral" },
+            { icon: "📝", title: "Script tab", desc: "Fill-in-the-blank template for your presentation + practice timer" },
+            { icon: "🎯", title: "Exam tab", desc: "Mock exam simulation, connectors practice, criteria, and examiner questions" },
+          ].map((item, i) => (
+            <div key={i} style={{
+              display: "flex", gap: 10, alignItems: "flex-start", padding: "6px 0",
+            }}>
+              <span style={{ fontSize: 16, flexShrink: 0, marginTop: 1 }}>{item.icon}</span>
+              <div>
+                <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 700, color: "#a5b4fc" }}>{item.title}</span>
+                <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: "#64748b" }}> — {item.desc}</span>
+              </div>
+            </div>
+          ))}
+          <div style={{
+            marginTop: 14, padding: "10px 14px", borderRadius: 8,
+            background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.15)",
+          }}>
+            <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#94a3b8", lineHeight: 1.6 }}>
+              <strong style={{ color: "#a5b4fc" }}>Tip:</strong> Start with any tab that interests you — your scores, SRS reviews, and proficiency will all appear here automatically. Keyboard shortcuts: <strong style={{ color: "#e2e8f0" }}>Space</strong> to flip, <strong style={{ color: "#e2e8f0" }}>1</strong>/<strong style={{ color: "#e2e8f0" }}>2</strong> to answer.
+            </div>
+          </div>
+          {!stats.hasLocalStorage && (
+            <div style={{
+              marginTop: 10, padding: "8px 12px", borderRadius: 8,
+              background: "rgba(245,158,11,0.05)", border: "1px solid rgba(245,158,11,0.15)",
+            }}>
+              <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#f59e0b" }}>
+                ⚠️ Open the downloaded HTML in your browser to save progress between sessions
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <details style={{ marginBottom: 16 }}>
+          <summary style={{
+            fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600, color: "#64748b",
+            cursor: "pointer", padding: "8px 12px", borderRadius: 8,
+            background: "#111827", border: "1px solid rgba(51,65,85,0.3)",
+            listStyle: "none", display: "flex", alignItems: "center", gap: 6,
+          }}>
+            <span>ℹ️ How to use this tool</span>
+          </summary>
+          <div style={{
+            padding: "12px 14px", marginTop: 6, borderRadius: 8,
+            background: "#111827", border: "1px solid rgba(51,65,85,0.3)",
+          }}>
+            {[
+              "Practice in any tab — Recall, Mastery, Type It, Build, or Match modes all track your progress",
+              "Keyboard shortcuts: Space to flip cards, 1/← for wrong, 2/→ for correct",
+              "SRS spaced repetition schedules reviews automatically — watch for ⚡ notification dots on tabs",
+              "Mock Exam in the Exam tab simulates the full oral with timer and random images",
+              "Cloud Sync at the bottom of this page lets you sync progress across devices via Google Drive",
+            ].map((tip, i) => (
+              <div key={i} style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#94a3b8", lineHeight: 1.6, padding: "3px 0 3px 14px", position: "relative" }}>
+                <span style={{ position: "absolute", left: 0, color: "#6366f1" }}>•</span>
+                {tip}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
       {/* SRS Due Items */}
       {dueCards.length > 0 && (
         <div style={{
@@ -3896,7 +4035,11 @@ function ProficiencyTab() {
           By practice mode
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          {Object.entries(modePerf).map(([mode, data]) => {
+          {Object.keys(modePerf).length === 0 ? (
+            <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: "#475569", padding: "12px 0" }}>
+              Practice in Recall, Mastery, Type It, or Match to see mode breakdown
+            </div>
+          ) : Object.entries(modePerf).map(([mode, data]) => {
             const meta = modeMeta[mode] || { label: mode, icon: "📝" };
             const acc = data.total > 0 ? Math.round((data.score / data.total) * 100) : 0;
             return (
@@ -3923,7 +4066,11 @@ function ProficiencyTab() {
           Recent activity
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {attempts.slice().reverse().slice(0, 15).map((a, i) => {
+          {attempts.length === 0 ? (
+            <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, color: "#475569", padding: "12px 0" }}>
+              Your practice history will appear here after your first round
+            </div>
+          ) : attempts.slice().reverse().slice(0, 15).map((a, i) => {
             const meta = catMeta[a.category] || { label: a.category, icon: "📦", color: "#94a3b8" };
             const mMeta = modeMeta[a.mode] || { label: a.mode, icon: "📝" };
             const pct = Math.round(a.pct * 100);
@@ -4075,10 +4222,327 @@ function ProficiencyTab() {
           )}
         </div>
       </div>
+
+      {/* Cloud Sync */}
+      <CloudSyncPanel />
     </div>
   );
 }
 
+
+
+// ─── Cloud Sync UI ───────────────────────────────────────────────────────────
+function CloudSyncPanel() {
+  const stats = useStats();
+  const [url, setUrl] = useState(getCloudUrl);
+  const [status, setStatus] = useState(getCloudUrl() ? "idle" : "disconnected"); // disconnected, idle, pushing, pulling, success, error
+  const [lastPush, setLastPush] = useState(() => {
+    try { return localStorage.getItem(CLOUD_LAST_PUSH_KEY) || ""; } catch { return ""; }
+  });
+  const [message, setMessage] = useState("");
+  const [showUrl, setShowUrl] = useState(!getCloudUrl());
+
+  const connect = async () => {
+    const trimmed = url.trim();
+    if (!trimmed.startsWith("https://script.google.com/")) {
+      setStatus("error");
+      setMessage("URL must start with https://script.google.com/");
+      return;
+    }
+    setCloudUrl(trimmed);
+    setStatus("pulling");
+    setMessage("Testing connection...");
+    
+    const result = await cloudPull();
+    if (result.ok) {
+      if (result.data && result.data.attempts && result.data.attempts.length > 0) {
+        const merged = mergeCloudData(
+          { attempts: stats.attempts, srs: stats.srs, totalSessions: stats.totalSessions, firstOpened: stats.firstOpened },
+          result.data
+        );
+        if (merged.attempts !== stats.attempts) {
+          stats.attempts = merged.attempts || [];
+          stats.srs = merged.srs || {};
+          stats._save();
+        }
+        setMessage(`Connected! Pulled ${result.data.attempts.length} rounds from cloud.`);
+      } else {
+        setMessage("Connected! No existing cloud data found.");
+      }
+      setStatus("success");
+      setShowUrl(false);
+    } else {
+      setStatus("error");
+      setMessage(result.error || "Connection failed");
+    }
+  };
+
+  const disconnect = () => {
+    setCloudUrl("");
+    setUrl("");
+    setStatus("disconnected");
+    setMessage("");
+    setShowUrl(true);
+    try { localStorage.removeItem(CLOUD_LAST_PUSH_KEY); } catch {}
+    setLastPush("");
+  };
+
+  const push = async () => {
+    setStatus("pushing");
+    setMessage("Pushing to cloud...");
+    const data = { attempts: stats.attempts, srs: stats.srs, totalSessions: stats.totalSessions, firstOpened: stats.firstOpened };
+    const result = await cloudPush(data);
+    if (result.ok) {
+      const now = new Date().toISOString();
+      setLastPush(now);
+      setStatus("success");
+      setMessage("Pushed successfully!");
+      SFX.correct();
+    } else {
+      setStatus("error");
+      setMessage(result.error || "Push failed");
+    }
+  };
+
+  const pull = async () => {
+    setStatus("pulling");
+    setMessage("Pulling from cloud...");
+    const result = await cloudPull();
+    if (result.ok) {
+      if (result.data && result.data.attempts) {
+        const merged = mergeCloudData(
+          { attempts: stats.attempts, srs: stats.srs, totalSessions: stats.totalSessions, firstOpened: stats.firstOpened },
+          result.data
+        );
+        if (merged.attempts !== stats.attempts) {
+          stats.attempts = merged.attempts || [];
+          stats.srs = merged.srs || {};
+          stats._save();
+          setMessage(`Pulled ${result.data.attempts.length} rounds. Data updated!`);
+        } else {
+          setMessage("Local data is newer or identical.");
+        }
+      } else {
+        setMessage("Cloud is empty.");
+      }
+      setStatus("success");
+      SFX.correct();
+    } else {
+      setStatus("error");
+      setMessage(result.error || "Pull failed");
+    }
+  };
+
+  const isConnected = getCloudUrl() && status !== "disconnected" && status !== "error";
+  const statusColor = status === "success" ? "#34d399" : status === "error" ? "#f87171" : status === "pushing" || status === "pulling" ? "#f59e0b" : isConnected ? "#34d399" : "#64748b";
+
+  const [showSetup, setShowSetup] = useState(false);
+
+  return (
+    <div style={{
+      padding: "16px 18px", borderRadius: 12, marginTop: 16,
+      background: "#111827", border: "1px solid rgba(51,65,85,0.4)",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 700, color: "#64748b", letterSpacing: "1.5px", textTransform: "uppercase" }}>
+          ☁️ Cloud Sync (Google Drive)
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor }} />
+          <span style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 10, color: statusColor, fontWeight: 600 }}>
+            {isConnected ? "Connected" : status === "error" ? "Error" : "Not connected"}
+          </span>
+        </div>
+      </div>
+
+      {/* URL input */}
+      {showUrl && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#94a3b8", marginBottom: 8, lineHeight: 1.5 }}>
+            Sync your progress across all your devices via Google Drive. Free, takes 2 minutes to set up.
+          </div>
+
+          {/* Setup instructions toggle */}
+          <button onClick={() => setShowSetup(!showSetup)} style={{
+            width: "100%", padding: "8px 12px", borderRadius: 8, marginBottom: 10, cursor: "pointer",
+            border: "1px solid rgba(99,102,241,0.2)", background: showSetup ? "rgba(99,102,241,0.06)" : "transparent",
+            color: "#a5b4fc", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 600,
+            textAlign: "left", display: "flex", alignItems: "center", gap: 6,
+          }}>
+            <span style={{ transition: "transform 0.2s", transform: showSetup ? "rotate(90deg)" : "rotate(0deg)", display: "inline-block" }}>▶</span>
+            {showSetup ? "Hide setup instructions" : "How to set up cloud sync (2 min)"}
+          </button>
+
+          {showSetup && (
+            <div style={{
+              padding: "14px 16px", borderRadius: 10, marginBottom: 12,
+              background: "linear-gradient(135deg, #1e1b4b, #0f172a)", border: "1px solid rgba(99,102,241,0.2)",
+            }}>
+              {[
+                { step: "1", title: "Open Google Apps Script", desc: "Go to script.google.com and sign in with your Google account. Click New project." },
+                { step: "2", title: "Paste the script", desc: "Delete the default code and paste this:" },
+              ].map((s, i) => (
+                <div key={i} style={{ marginBottom: 10 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                    <span style={{
+                      fontFamily: "'DM Sans', sans-serif", fontSize: 10, fontWeight: 700, color: "#0c0f1a",
+                      background: "#a5b4fc", width: 20, height: 20, borderRadius: "50%", flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1,
+                    }}>{s.step}</span>
+                    <div>
+                      <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 700, color: "#e2e8f0" }}>{s.title}</div>
+                      <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#94a3b8", lineHeight: 1.5, marginTop: 2 }}>{s.desc}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {/* Code block */}
+              <div style={{
+                padding: "10px 12px", borderRadius: 8, marginBottom: 12,
+                background: "rgba(0,0,0,0.3)", border: "1px solid rgba(51,65,85,0.3)",
+                fontFamily: "monospace", fontSize: 9, color: "#94a3b8", lineHeight: 1.5,
+                whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 200, overflow: "auto",
+                WebkitOverflowScrolling: "touch", position: "relative",
+              }}>
+                <button onClick={() => {
+                  const code = `function doGet(e) {\n  if (e && e.parameter && e.parameter.action === 'load') {\n    var files = DriveApp.getFilesByName('french-oral-save.json');\n    if (files.hasNext()) {\n      var content = files.next().getBlob().getDataAsString();\n      return ContentService.createTextOutput(content).setMimeType(ContentService.MimeType.JSON);\n    }\n    return ContentService.createTextOutput('{}').setMimeType(ContentService.MimeType.JSON);\n  }\n  return ContentService.createTextOutput('{"status":"ok"}').setMimeType(ContentService.MimeType.JSON);\n}\n\nfunction doPost(e) {\n  try {\n    var body = JSON.parse(e.postData.contents);\n    var data = JSON.stringify(body.data);\n    var files = DriveApp.getFilesByName('french-oral-save.json');\n    if (files.hasNext()) { files.next().setContent(data); }\n    else { DriveApp.createFile('french-oral-save.json', data, 'application/json'); }\n    return ContentService.createTextOutput(JSON.stringify({success:true})).setMimeType(ContentService.MimeType.JSON);\n  } catch(err) {\n    return ContentService.createTextOutput(JSON.stringify({success:false,error:err.toString()})).setMimeType(ContentService.MimeType.JSON);\n  }\n}`;
+                  navigator.clipboard?.writeText(code).then(() => {}).catch(() => {});
+                }} style={{
+                  position: "absolute", top: 6, right: 6, padding: "3px 8px", borderRadius: 4,
+                  border: "1px solid rgba(99,102,241,0.3)", background: "rgba(99,102,241,0.1)",
+                  color: "#a5b4fc", fontFamily: "'DM Sans', sans-serif", fontSize: 9, fontWeight: 700, cursor: "pointer",
+                }}>Copy</button>
+{`function doGet(e) {
+  if (e && e.parameter && e.parameter.action === 'load') {
+    var files = DriveApp.getFilesByName('french-oral-save.json');
+    if (files.hasNext()) {
+      var content = files.next().getBlob().getDataAsString();
+      return ContentService.createTextOutput(content)
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    return ContentService.createTextOutput('{}')
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  return ContentService.createTextOutput('{"status":"ok"}')
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  try {
+    var body = JSON.parse(e.postData.contents);
+    var data = JSON.stringify(body.data);
+    var files = DriveApp.getFilesByName('french-oral-save.json');
+    if (files.hasNext()) { files.next().setContent(data); }
+    else { DriveApp.createFile('french-oral-save.json', data,
+      'application/json'); }
+    return ContentService.createTextOutput(
+      JSON.stringify({success:true}))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(
+      JSON.stringify({success:false, error:err.toString()}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}`}
+              </div>
+
+              {[
+                { step: "3", title: "Deploy", desc: "Click Deploy → New deployment → ⚙️ Web app. Set \"Execute as: Me\" and \"Who has access: Anyone\". Click Deploy and authorize when prompted." },
+                { step: "4", title: "Copy the URL", desc: "Copy the Web app URL (starts with https://script.google.com/macros/s/...)." },
+                { step: "5", title: "Paste below", desc: "Paste the URL into the field below and click Connect. That's it!" },
+              ].map((s, i) => (
+                <div key={i} style={{ marginBottom: 10 }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                    <span style={{
+                      fontFamily: "'DM Sans', sans-serif", fontSize: 10, fontWeight: 700, color: "#0c0f1a",
+                      background: "#a5b4fc", width: 20, height: 20, borderRadius: "50%", flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center", marginTop: 1,
+                    }}>{s.step}</span>
+                    <div>
+                      <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 700, color: "#e2e8f0" }}>{s.title}</div>
+                      <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: "#94a3b8", lineHeight: 1.5, marginTop: 2 }}>{s.desc}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              <div style={{
+                padding: "8px 12px", borderRadius: 6,
+                background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.15)",
+              }}>
+                <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 10, color: "#f59e0b", lineHeight: 1.5 }}>
+                  If you see "This app isn't verified" — click <strong>Advanced</strong> → <strong>Go to project (unsafe)</strong>. It's safe — you wrote the script yourself on your own account.
+                </div>
+              </div>
+            </div>
+          )}
+
+          <input
+            value={url} onChange={e => setUrl(e.target.value)}
+            placeholder="https://script.google.com/macros/s/..."
+            style={{
+              width: "100%", padding: "10px 12px", borderRadius: 8, boxSizing: "border-box",
+              border: "1px solid rgba(99,102,241,0.2)", background: "rgba(0,0,0,0.2)",
+              color: "#e2e8f0", fontSize: 12, fontFamily: "'DM Sans', sans-serif", outline: "none",
+              marginBottom: 8,
+            }}
+          />
+          <button onClick={connect} disabled={!url.trim()} style={{
+            width: "100%", padding: "10px", borderRadius: 8, border: "none", cursor: url.trim() ? "pointer" : "default",
+            background: url.trim() ? "linear-gradient(135deg, #6366f1, #818cf8)" : "#1e293b",
+            color: url.trim() ? "#fff" : "#475569",
+            fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 700,
+          }}>Connect</button>
+        </div>
+      )}
+
+      {/* Connected state */}
+      {isConnected && !showUrl && (
+        <div>
+          {lastPush && (
+            <div style={{ fontFamily: "'DM Sans', sans-serif", fontSize: 10, color: "#64748b", marginBottom: 10 }}>
+              Last pushed: {new Date(lastPush).toLocaleString()}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <button onClick={push} disabled={status === "pushing"} style={{
+              flex: 1, padding: "10px", borderRadius: 8, cursor: "pointer",
+              border: "1px solid rgba(99,102,241,0.3)", background: "rgba(99,102,241,0.06)",
+              color: "#a5b4fc", fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600,
+            }}>⬆ Push to Cloud</button>
+            <button onClick={pull} disabled={status === "pulling"} style={{
+              flex: 1, padding: "10px", borderRadius: 8, cursor: "pointer",
+              border: "1px solid rgba(52,211,153,0.3)", background: "rgba(52,211,153,0.06)",
+              color: "#34d399", fontFamily: "'DM Sans', sans-serif", fontSize: 12, fontWeight: 600,
+            }}>⬇ Pull from Cloud</button>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setShowUrl(true)} style={{
+              flex: 1, padding: "8px", borderRadius: 8, cursor: "pointer",
+              border: "1px solid rgba(51,65,85,0.3)", background: "transparent",
+              color: "#64748b", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 600,
+            }}>Change URL</button>
+            <button onClick={disconnect} style={{
+              flex: 1, padding: "8px", borderRadius: 8, cursor: "pointer",
+              border: "1px solid rgba(239,68,68,0.2)", background: "transparent",
+              color: "#f87171", fontFamily: "'DM Sans', sans-serif", fontSize: 11, fontWeight: 600,
+            }}>Disconnect</button>
+          </div>
+        </div>
+      )}
+
+      {/* Status message */}
+      {message && (
+        <div style={{
+          fontFamily: "'DM Sans', sans-serif", fontSize: 11, color: statusColor,
+          marginTop: 8, padding: "6px 10px", borderRadius: 6,
+          background: `${statusColor}10`, border: `1px solid ${statusColor}20`,
+        }}>{message}</div>
+      )}
+    </div>
+  );
+}
 
 // ─── Practice Timer ──────────────────────────────────────────────────────────
 function PracticeTimer() {
